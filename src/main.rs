@@ -1,41 +1,39 @@
-mod authentication;
 mod admin;
-mod template;
+mod config;
+mod content;
+mod db;
+mod middlewares;
+mod routes;
 
-use rocket::fairing::AdHoc;
-use rocket::figment::{Figment, Profile};
-use rocket::figment::providers::{Env, Format, Serialized, Toml};
-use serde::{Deserialize, Serialize};
-use crate::authentication::{routes::auth_routes, auth_db::{AuthDbInit, AuthDbCleaner}};
-use admin::routes::admin_routes;
+use admin::routes::AdminRouter;
+use config::{Config, CONFIG};
+use db::DB;
+use eyre::{eyre, Report, WrapErr};
+use routes::PublicRouter;
+use salvo::{
+    catcher::{Catcher, DefaultGoal},
+    prelude::*,
+};
+use tracing::info;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let figment = Figment::from(rocket::Config::default())
-        // When need additional server config
-        .merge(Serialized::defaults(Config::default()))
-        // should be made configurable with user home config directory as default
-        .merge(Toml::file("config/server.toml").nested())
-        // to configure each config via env var
-        .merge(Env::prefixed("SAICMS_").global())
-        .select(Profile::from_env_or("SAICMS_PROFILE", "default"))
-        .merge(("jwt_secret", "secret"))
-        .merge(("login_timeout", 60))
-        .merge(("cleanup_interval", 24));
-    let login_timeout = figment.extract::<Config>()?.login_timeout;
-    let _rocket = rocket::custom(figment)
-        .attach(AdHoc::config::<Config>())
-        .attach(AuthDbInit)
-        .attach(AuthDbCleaner::new(login_timeout))
-        .mount("/auth", auth_routes())
-        .mount("/admin", admin_routes())
-        .launch().await?;
-    Ok(())  
-}
+async fn main() -> Result<(), Report> {
+    tracing_subscriber::fmt().init();
+    info!("Starting saicms");
 
-#[derive(Debug, Default, Serialize, Deserialize)]   
-struct Config {
-    jwt_secret: String,
-    login_timeout: u32,
-    cleanup_interval: u32
+    Config::init();
+
+    db::initialize_db().wrap_err("Failed to initialize database")?;
+    let _is_db = match DB.get() {
+        Some(s) => s,
+        None => return Err(eyre!("DB is not initialized")),
+    };
+    let router = Router::new().admin().public();
+    let acceptor = TcpListener::new("0.0.0.0:8000").bind().await;
+    let goal = DefaultGoal::with_footer("TEST");
+    let catcher = Catcher::default().hoop(goal);
+    let service = Service::new(router).catcher(catcher);
+    info!("Starting endpoint");
+    Server::new(acceptor).serve(service).await;
+    Ok(())
 }
